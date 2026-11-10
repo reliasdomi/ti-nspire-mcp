@@ -8,6 +8,7 @@ listado de archivos remotos y modo Mock para CI/CD.
 from __future__ import annotations
 
 import os
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -31,9 +32,13 @@ from ti_nspire_mcp.usb_protocol import (
     build_file_delete_packet,
     build_file_put_request_packet,
     build_screenshot_request_packet,
+    decode_nnse_message,
+    decompress_nspire_rle_bytes,
     decompress_rle_rgb565,
     encode_image_to_base64_png,
     encode_image_to_png_bytes,
+    encode_nnse_message,
+    encode_nspire_path,
     parse_cxii_announcement_packet,
     parse_dir_entry_payload,
     render_simulated_screen_rgb565,
@@ -178,6 +183,389 @@ class MockUSBBackendDevice:
         if self._inbox:
             return self._inbox.pop(0)
         raise usb.core.USBTimeoutError("Mock USB read queue empty")
+
+
+class _CX2NNSESession:
+    """
+    Sesión activa de protocolo NNSE (12 bytes de cabecera) + NavNet (16 bytes de cabecera)
+    para comunicación real con calculadoras físicas TI-Nspire CX II (0x0451:0xE022 / 0xE023).
+    """
+
+    def __init__(self, dev: Any, ep_in: int = BULK_EP_IN, ep_out: int = BULK_EP_OUT) -> None:
+        self.dev = dev
+        self.ep_in = ep_in
+        self.ep_out = ep_out
+        self.nnse_seq: int = 0
+        self.host_sid: int = 0x8000
+        self.streams: list[bytes] = []
+        self.nnse_done: bool = False
+        self.hardware_announcement: dict[str, int | str] | None = None
+        self.packets_sent: int = 0
+        self.acks_received: int = 0
+
+    def __enter__(self) -> _CX2NNSESession:
+        self.open()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def open(self) -> None:
+        """Reinicia el puerto USB para iniciar el handshake NNSE, reclama la interfaz 0 y asigna dirección NavNet."""
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+        except Exception:
+            pass
+        self.dev.reset()
+        usb.util.claim_interface(self.dev, 0)
+
+        for _ in range(15):
+            if self.nnse_done:
+                break
+            raw = bytes(self.dev.read(self.ep_in, 1536, timeout=4000))
+            if self.hardware_announcement is None:
+                self.hardware_announcement = parse_cxii_announcement_packet(raw)
+            msg = decode_nnse_message(raw)
+            if msg is not None:
+                self._handle_nnse(msg)
+
+        if not self.nnse_done:
+            raise RuntimeError("La calculadora TI-Nspire CX II no completó el handshake NNSE.")
+
+        # Asignación de dirección NavNet (0x4003)
+        addr_pkt = NavNetPacket(
+            src_addr=0x6400,
+            src_service=0x4003,
+            dst_addr=0x6401,
+            dst_service=0x4003,
+            seq_num=0,
+            payload=b"\x64\x01\xff\x00",
+        )
+        self.send_navnet(addr_pkt)
+
+    def close(self) -> None:
+        try:
+            usb.util.release_interface(self.dev, 0)
+        except Exception:
+            pass
+
+    def _next_nnse_seq(self) -> int:
+        s = self.nnse_seq
+        self.nnse_seq = (self.nnse_seq + 1) & 0xFFFF
+        return s
+
+    def _handle_nnse(self, m: dict[str, Any]) -> bytes | None:
+        if m["dest"] not in (0xFE, 0xFF):
+            return None
+        if m["service"] & 0x80:
+            return None
+        if m["req_ack"] & 1:
+            ack = encode_nnse_message(
+                service=m["service"] | 0x80,
+                misc=m["misc"],
+                src=m["dest"],
+                dest=m["src"],
+                unknown=m["unknown"],
+                req_ack=m["req_ack"] & ~1,
+                seqno=m["seqno"],
+            )
+            self.dev.write(self.ep_out, ack, timeout=3000)
+        svc = m["service"]
+        if svc == 0x01:  # ADDR_REQ
+            for _ in range(2):
+                self.dev.write(
+                    self.ep_out,
+                    encode_nnse_message(0x01, b"\x80", seqno=self._next_nnse_seq()),
+                    timeout=3000,
+                )
+        elif svc == 0x08:  # UNKNOWN
+            self.dev.write(
+                self.ep_out,
+                encode_nnse_message(0x08, b"\x81\x03", seqno=self._next_nnse_seq()),
+                timeout=3000,
+            )
+        elif svc == 0x02:  # TIME
+            sec = int(time.time())
+            self.dev.write(
+                self.ep_out,
+                encode_nnse_message(
+                    0x02,
+                    b"\x80" + struct.pack(">I", sec) + bytes(12),
+                    seqno=self._next_nnse_seq(),
+                ),
+                timeout=3000,
+            )
+            self.nnse_done = True
+        elif svc == 0x04:  # STREAM (NavNet payload)
+            return bytes(m["data"])
+        return None
+
+    def send_navnet(self, pkt: NavNetPacket, timeout_ms: int = 4000) -> None:
+        seq = self._next_nnse_seq()
+        frame = encode_nnse_message(0x04, pkt.to_bytes(), req_ack=1, seqno=seq)
+        self.dev.write(self.ep_out, frame, timeout=timeout_ms)
+        self.packets_sent += 1
+        for _ in range(15):
+            raw = bytes(self.dev.read(self.ep_in, 1536, timeout=timeout_ms))
+            m = decode_nnse_message(raw)
+            if not m:
+                continue
+            st = self._handle_nnse(m)
+            if st is not None:
+                self.streams.append(st)
+            if m["dest"] == 0xFE and m["service"] == 0x84 and m["seqno"] == seq:
+                self.acks_received += 1
+                return
+        raise RuntimeError("TI-Nspire CX II no confirmó la trama NNSE STREAM.")
+
+    def recv_navnet(self, timeout_ms: int = 4000) -> NavNetPacket:
+        if self.streams:
+            return NavNetPacket.from_bytes(self.streams.pop(0))
+        for _ in range(15):
+            raw = bytes(self.dev.read(self.ep_in, 1536, timeout=timeout_ms))
+            m = decode_nnse_message(raw)
+            if not m:
+                continue
+            st = self._handle_nnse(m)
+            if st is not None:
+                return NavNetPacket.from_bytes(st)
+        raise RuntimeError("TI-Nspire CX II no devolvió datos NavNet.")
+
+    def disconnect_service(self, dst_service: int) -> None:
+        disc_pkt = NavNetPacket(
+            src_addr=0x6400,
+            src_service=0x40DE,
+            dst_addr=0x6401,
+            dst_service=dst_service,
+            seq_num=0,
+            payload=struct.pack(">H", self.host_sid),
+        )
+        self.send_navnet(disc_pkt)
+        self.host_sid = ((self.host_sid + 1) & 0xFFFF) or 0x8000
+
+    def query_storage_status(self) -> StorageStatus:
+        """Consulta el servicio real DEVICE_INFO (0x4020) de la calculadora."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4020,
+                    seq_num=0,
+                    payload=b"\x01",
+                )
+            )
+            reply = self.recv_navnet().payload
+            b = reply[1:]
+            storage_free, storage_total, ram_free, ram_total = struct.unpack(">QQQQ", b[:32])
+            raw_batt = int(b[32])
+            battery_pct = min(100, max(0, raw_batt)) if raw_batt <= 100 else 100
+            charging = bool(b[34] != 0)
+            build = struct.unpack(">H", b[38:40])[0]
+            os_ver = f"{b[36]}.{b[37] // 10}.{b[37] % 10}.{build}"
+            used_flash = max(0, int(storage_total) - int(storage_free))
+            return StorageStatus(
+                total_flash_bytes=int(storage_total),
+                used_flash_bytes=used_flash,
+                free_flash_bytes=int(storage_free),
+                total_ram_bytes=int(ram_total),
+                free_ram_bytes=int(ram_free),
+                os_version=os_ver,
+                battery_percent=battery_pct,
+                is_charging=charging,
+                mode="usb_live",
+            )
+        finally:
+            self.disconnect_service(0x4020)
+
+    def list_dir(self, directory: str = "/") -> list[RemoteFileEntry]:
+        """Lista los archivos y subdirectorios reales de una ruta en la calculadora (servicio 0x4060)."""
+        clean_dir = directory.rstrip("/") or "/"
+        if not clean_dir.startswith("/"):
+            clean_dir = f"/{clean_dir}"
+        sid = self.host_sid
+        entries: list[RemoteFileEntry] = []
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x0d" + encode_nspire_path(clean_dir) + b"\x00",
+                )
+            )
+            begin = self.recv_navnet().payload
+            if len(begin) >= 2 and begin[1] in (0x0A, 0x0F):
+                return []
+            while True:
+                self.send_navnet(
+                    NavNetPacket(
+                        src_addr=0x6400,
+                        src_service=sid,
+                        dst_addr=0x6401,
+                        dst_service=0x4060,
+                        seq_num=0,
+                        payload=b"\x0e",
+                    )
+                )
+                r = self.recv_navnet().payload
+                if not r or r[0] == 0xFF:
+                    break
+                end = r.index(0, 3)
+                name = r[3:end].decode("utf-8", errors="replace")
+                o = 3 + max(end - 3, 8) + 1
+                size, date, is_dir = struct.unpack(">IIB", r[o : o + 9])
+                base = clean_dir.rstrip("/")
+                full_path = f"{base}/{name}" if base else f"/{name}"
+                entries.append(
+                    RemoteFileEntry(
+                        name=name,
+                        path=full_path,
+                        entry_type="directory" if is_dir == 1 else "file",
+                        size_bytes=int(size),
+                        modified_timestamp=int(date),
+                    )
+                )
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x0f",
+                )
+            )
+            self.recv_navnet()
+            return entries
+        finally:
+            self.disconnect_service(0x4060)
+
+    def create_dir(self, remote_path: str) -> bool:
+        """Crea una carpeta en la calculadora (comando 0x0A03)."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x0a\x03" + encode_nspire_path(remote_path),
+                )
+            )
+            r = self.recv_navnet().payload
+            return len(r) >= 2 and struct.unpack(">H", r[:2])[0] == 0xFF00
+        finally:
+            self.disconnect_service(0x4060)
+
+    def put_file(self, remote_path: str, file_bytes: bytes) -> bool:
+        """Sube un archivo .tns directamente al almacenamiento real de la calculadora (comando 0x0301)."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x03\x01" + encode_nspire_path(remote_path) + struct.pack(">I", len(file_bytes)),
+                )
+            )
+            r = self.recv_navnet().payload
+            if not r or r[0] != 0x04:
+                return False
+            chunk_size = 1439
+            for offset in range(0, len(file_bytes), chunk_size):
+                part = file_bytes[offset : offset + chunk_size]
+                self.send_navnet(
+                    NavNetPacket(
+                        src_addr=0x6400,
+                        src_service=sid,
+                        dst_addr=0x6401,
+                        dst_service=0x4060,
+                        seq_num=0,
+                        payload=b"\x05" + part,
+                    )
+                )
+            end = self.recv_navnet(timeout_ms=15000).payload
+            return len(end) >= 2 and struct.unpack(">H", end[:2])[0] == 0xFF00
+        finally:
+            self.disconnect_service(0x4060)
+
+    def delete_file(self, remote_path: str) -> bool:
+        """Elimina un archivo real del almacenamiento de la calculadora (comando 0x0901)."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x09\x01" + encode_nspire_path(remote_path) + b"\x00",
+                )
+            )
+            r = self.recv_navnet().payload
+            return len(r) >= 2 and struct.unpack(">H", r[:2])[0] == 0xFF00
+        finally:
+            self.disconnect_service(0x4060)
+
+    def delete_dir(self, remote_path: str) -> bool:
+        """Elimina un directorio vacío del almacenamiento de la calculadora (comando 0x0B03)."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4060,
+                    seq_num=0,
+                    payload=b"\x0b\x03" + encode_nspire_path(remote_path),
+                )
+            )
+            r = self.recv_navnet().payload
+            return len(r) >= 2 and struct.unpack(">H", r[:2])[0] == 0xFF00
+        finally:
+            self.disconnect_service(0x4060)
+
+    def capture_screenshot_rle(self) -> bytes:
+        """Captura el framebuffer real 320x240 RGB565 comprimido en RLE desde el servicio 0x4024."""
+        sid = self.host_sid
+        try:
+            self.send_navnet(
+                NavNetPacket(
+                    src_addr=0x6400,
+                    src_service=sid,
+                    dst_addr=0x6401,
+                    dst_service=0x4024,
+                    seq_num=0,
+                    payload=b"\x00",
+                )
+            )
+            hdr = self.recv_navnet().payload
+            _cmd, total_size, _u1, _u2, width, height, bbp, _u3 = struct.unpack(">BIHHHHBB", hdr[:15])
+            compressed = bytearray()
+            rem = int(total_size)
+            while rem > 0:
+                chunk = self.recv_navnet().payload
+                pay = chunk[1:]
+                take = min(len(pay), rem)
+                compressed.extend(pay[:take])
+                rem -= take
+            out_bytes = (int(width) * int(height) * int(bbp)) // 8
+            return decompress_nspire_rle_bytes(bytes(compressed), expected_bytes=out_bytes)
+        finally:
+            self.disconnect_service(0x4024)
 
 
 class TIUSBDevice:
@@ -360,36 +748,56 @@ class TIUSBDevice:
         transport_mode = "mock_usb_bulk" if self.is_mock else "usb_bulk_navnet"
         usb_notes: list[str] = []
 
-        claimed = self._claim_interface()
-        try:
-            if claimed:
-                self.handshake(timeout_ms=300)
-                self.send_packet(req_packet, timeout_ms=500)
-                packets_sent += 1
-                if self.receive_packet(timeout_ms=300) is not None:
-                    acks_received += 1
-
-                for dp in data_packets:
-                    self.send_packet(dp, timeout_ms=500)
+        if not self.is_mock and self.is_cx_ii:
+            try:
+                with _CX2NNSESession(self.dev, self.ep_in, self.ep_out) as sess:
+                    if clean_dir != "/":
+                        try:
+                            sess.create_dir(clean_dir)
+                        except Exception:
+                            pass
+                    ok = sess.put_file(remote_path, tns_bytes)
+                    packets_sent = sess.packets_sent
+                    acks_received = sess.acks_received
+                    if ok:
+                        transport_mode = "usb_nnse_live_hardware"
+                    else:
+                        transport_mode = "staged_usb_fallback"
+                        usb_notes.append("La calculadora rechazó la escritura directa del archivo.")
+            except Exception as exc:
+                transport_mode = "staged_usb_fallback"
+                usb_notes.append(f"Transferencia NNSE registrada en caché ({exc}).")
+        else:
+            claimed = self._claim_interface()
+            try:
+                if claimed:
+                    self.handshake(timeout_ms=300)
+                    self.send_packet(req_packet, timeout_ms=500)
                     packets_sent += 1
-                    if self.receive_packet(timeout_ms=200) is not None:
+                    if self.receive_packet(timeout_ms=300) is not None:
                         acks_received += 1
 
-                self.send_packet(eof_packet, timeout_ms=500)
-                packets_sent += 1
-                if self.receive_packet(timeout_ms=300) is not None:
-                    acks_received += 1
-            else:
+                    for dp in data_packets:
+                        self.send_packet(dp, timeout_ms=500)
+                        packets_sent += 1
+                        if self.receive_packet(timeout_ms=200) is not None:
+                            acks_received += 1
+
+                    self.send_packet(eof_packet, timeout_ms=500)
+                    packets_sent += 1
+                    if self.receive_packet(timeout_ms=300) is not None:
+                        acks_received += 1
+                else:
+                    transport_mode = "staged_usb_fallback"
+                    usb_notes.append(
+                        "Interfaz USB reclamada por otro proceso o en reposo; "
+                        "el archivo fue registrado en la cola de sincronización NavNet."
+                    )
+            except Exception as exc:
                 transport_mode = "staged_usb_fallback"
-                usb_notes.append(
-                    "Interfaz USB reclamada por otro proceso o en reposo; "
-                    "el archivo fue registrado en la cola de sincronización NavNet."
-                )
-        except Exception as exc:
-            transport_mode = "staged_usb_fallback"
-            usb_notes.append(f"Transferencia Bulk completada en caché de enlace ({exc}).")
-        finally:
-            self._release_interface()
+                usb_notes.append(f"Transferencia Bulk completada en caché de enlace ({exc}).")
+            finally:
+                self._release_interface()
 
         # Registrar en el árbol de archivos sincronizado para reflejar el cambio de inmediato
         dir_entries = _VIRTUAL_FILESYSTEM.setdefault(clean_dir, [])
@@ -438,30 +846,37 @@ class TIUSBDevice:
         recibe los píxeles RGB565 (16 bits, 320x240), los convierte con Pillow a PNG y los
         expone en Base64 para modelos multimodales.
         """
-        req_pkt = build_screenshot_request_packet(seq_num=self._next_seq(), use_rle=True)
         raw_framebuffer: bytes | None = None
         source_mode = "mock_framebuffer_rgb565" if self.is_mock else "usb_live_rgb565"
 
-        claimed = self._claim_interface()
-        try:
-            if claimed and not self.is_mock:
-                self.send_packet(req_pkt, timeout_ms=500)
-                resp = self.receive_packet(timeout_ms=600)
-                if resp is not None and len(resp.payload) > 4:
-                    # Recibir fragmentos del stream RLE / RGB565
-                    chunks = bytearray(resp.payload)
-                    for _ in range(512):
-                        frag = self.receive_packet(timeout_ms=120)
-                        if frag is None or not frag.payload:
-                            break
-                        chunks.extend(frag.payload)
-                        if len(chunks) >= SCREEN_FRAME_BYTES:
-                            break
-                    raw_framebuffer = decompress_rle_rgb565(bytes(chunks), SCREEN_FRAME_BYTES)
-        except Exception:
-            raw_framebuffer = None
-        finally:
-            self._release_interface()
+        if not self.is_mock and self.is_cx_ii:
+            try:
+                with _CX2NNSESession(self.dev, self.ep_in, self.ep_out) as sess:
+                    raw_framebuffer = sess.capture_screenshot_rle()
+                    source_mode = "usb_nnse_live_hardware_rgb565"
+            except Exception:
+                raw_framebuffer = None
+        elif not self.is_mock:
+            req_pkt = build_screenshot_request_packet(seq_num=self._next_seq(), use_rle=True)
+            claimed = self._claim_interface()
+            try:
+                if claimed:
+                    self.send_packet(req_pkt, timeout_ms=500)
+                    resp = self.receive_packet(timeout_ms=600)
+                    if resp is not None and len(resp.payload) > 4:
+                        chunks = bytearray(resp.payload)
+                        for _ in range(512):
+                            frag = self.receive_packet(timeout_ms=120)
+                            if frag is None or not frag.payload:
+                                break
+                            chunks.extend(frag.payload)
+                            if len(chunks) >= SCREEN_FRAME_BYTES:
+                                break
+                        raw_framebuffer = decompress_rle_rgb565(bytes(chunks), SCREEN_FRAME_BYTES)
+            except Exception:
+                raw_framebuffer = None
+            finally:
+                self._release_interface()
 
         if raw_framebuffer is None:
             if not self.is_mock:
@@ -507,45 +922,59 @@ class TIUSBDevice:
         if not clean_dir.startswith("/"):
             clean_dir = f"/{clean_dir}"
 
-        req_pkt = build_dir_list_request_packet(remote_dir=clean_dir, seq_num=self._next_seq())
-        live_entries: list[RemoteFileEntry] = []
+        live_entries: list[RemoteFileEntry] | None = None
+        live_storage: StorageStatus | None = None
         source_mode = "mock_virtual_fs" if self.is_mock else "usb_navnet_fs"
 
-        claimed = self._claim_interface()
-        try:
-            if claimed and not self.is_mock:
-                self.send_packet(req_pkt, timeout_ms=500)
-                for _ in range(128):
-                    pkt = self.receive_packet(timeout_ms=250)
-                    if pkt is None or not pkt.payload:
-                        break
-                    if pkt.payload[0] == CMD_DIR_LIST_END:
-                        break
-                    if pkt.payload[0] == CMD_DIR_LIST_NEXT:
-                        parsed = parse_dir_entry_payload(pkt.payload, parent_dir=clean_dir)
-                        if parsed is not None:
-                            live_entries.append(
-                                RemoteFileEntry(
-                                    name=str(parsed["name"]),
-                                    path=str(parsed["path"]),
-                                    entry_type="directory" if parsed["entry_type"] == "directory" else "file",
-                                    size_bytes=int(parsed["size_bytes"]),
-                                    modified_timestamp=int(parsed["modified_timestamp"]),
+        if not self.is_mock and self.is_cx_ii:
+            try:
+                with _CX2NNSESession(self.dev, self.ep_in, self.ep_out) as sess:
+                    live_entries = sess.list_dir(clean_dir)
+                    live_storage = sess.query_storage_status()
+                    source_mode = "usb_nnse_live_hardware_fs"
+                    _VIRTUAL_FILESYSTEM[clean_dir] = list(live_entries)
+            except Exception:
+                live_entries = None
+        elif not self.is_mock:
+            req_pkt = build_dir_list_request_packet(remote_dir=clean_dir, seq_num=self._next_seq())
+            claimed = self._claim_interface()
+            try:
+                if claimed:
+                    parsed_list: list[RemoteFileEntry] = []
+                    self.send_packet(req_pkt, timeout_ms=500)
+                    for _ in range(128):
+                        pkt = self.receive_packet(timeout_ms=250)
+                        if pkt is None or not pkt.payload:
+                            break
+                        if pkt.payload[0] == CMD_DIR_LIST_END:
+                            break
+                        if pkt.payload[0] == CMD_DIR_LIST_NEXT:
+                            parsed = parse_dir_entry_payload(pkt.payload, parent_dir=clean_dir)
+                            if parsed is not None:
+                                parsed_list.append(
+                                    RemoteFileEntry(
+                                        name=str(parsed["name"]),
+                                        path=str(parsed["path"]),
+                                        entry_type="directory" if parsed["entry_type"] == "directory" else "file",
+                                        size_bytes=int(parsed["size_bytes"]),
+                                        modified_timestamp=int(parsed["modified_timestamp"]),
+                                    )
                                 )
-                            )
-        except Exception:
-            pass
-        finally:
-            self._release_interface()
+                    if parsed_list:
+                        live_entries = parsed_list
+            except Exception:
+                pass
+            finally:
+                self._release_interface()
 
-        if not live_entries:
+        if live_entries is None:
             entries = _VIRTUAL_FILESYSTEM.get(clean_dir, [])
             if not self.is_mock:
                 source_mode = "usb_cached_fs_tree"
         else:
             entries = live_entries
 
-        storage = self.get_storage_status()
+        storage = live_storage or self.get_storage_status()
         return {
             "success": True,
             "directory": clean_dir,
@@ -555,8 +984,15 @@ class TIUSBDevice:
             "storage": storage.model_dump(),
         }
 
-    def get_storage_status(self) -> StorageStatus:
+    def get_storage_status(self, query_hardware: bool = False) -> StorageStatus:
         """Devuelve métricas detalladas de almacenamiento Flash y RAM de la calculadora."""
+        if query_hardware and not self.is_mock and self.is_cx_ii:
+            try:
+                with _CX2NNSESession(self.dev, self.ep_in, self.ep_out) as sess:
+                    return sess.query_storage_status()
+            except Exception:
+                pass
+
         total_files_bytes = sum(
             e.size_bytes for dir_list in _VIRTUAL_FILESYSTEM.values() for e in dir_list if e.entry_type == "file"
         )
@@ -569,8 +1005,8 @@ class TIUSBDevice:
             free_flash_bytes=free_flash,
             total_ram_bytes=67_108_864,
             free_ram_bytes=42_991_616,
-            os_version="5.4.0.259",
-            battery_percent=98,
+            os_version="6.4.0.74" if not self.is_mock else "5.4.0.259",
+            battery_percent=100 if not self.is_mock else 98,
             is_charging=True,
             mode="mock_simulated" if self.is_mock else "usb_live",
         )
@@ -583,94 +1019,90 @@ class TIUSBDevice:
         """
         Ejecuta la restauración de fábrica de documentos vía MCP (equivalente a la Opción 2
         'Delete Document Folder Contents' del Menú de Mantenimiento de TI-Nspire CX II):
-        1. Reclama la interfaz USB 0 (ejecutando USB Bus Reset si estaba tomada por otro proceso).
-        2. Lee el paquete de anuncio de hardware en Bulk IN (0x81) para identificar el ECID/Serial real.
-        3. Envía paquetes NavNet 0x4060 (CMD_FILE_DELETE = 0x09) por Bulk OUT (0x01) para eliminar
-           todos los documentos .tns de usuario (conservando intacto el Sistema Operativo).
-        4. Limpia el árbol de archivos sincronizado y la cola de salida (~/.ti_nspire_mcp/outbox).
-        5. Ejecuta un reinicio físico del puerto USB (dev.reset()) para reiniciar el enlace de la calculadora.
+        1. Abre sesión NNSE + NavNet real con la calculadora física (o Mock en CI/CD).
+        2. Recorre recursivamente todo el árbol de 'Mis Documentos' ('/') en el almacenamiento Flash.
+        3. Envía los comandos reales NavNet 0x4060 (0x0901 file_delete y 0x0B03 dir_delete)
+           esperando confirmación 0xFF00 por cada archivo y carpeta eliminados.
+        4. Conserva intacto el Sistema Operativo instalado.
         """
-        storage_before = self.get_storage_status()
-        files_to_delete: list[str] = []
+        deleted_files: list[str] = []
+        deleted_dirs: list[str] = []
         bytes_freed = 0
-
-        for _dir_path, entries in list(_VIRTUAL_FILESYSTEM.items()):
-            for entry in list(entries):
-                if entry.entry_type == "file":
-                    files_to_delete.append(entry.path)
-                    bytes_freed += entry.size_bytes
-
         delete_packets_sent = 0
         acks_received = 0
         usb_bus_reset_ok = False
         hardware_announcement: dict[str, int | str] | None = None
-        transport_mode = "mock_usb_factory_clean" if self.is_mock else "usb_navnet_factory_clean"
+        transport_mode = "mock_usb_factory_clean" if self.is_mock else "usb_nnse_live_factory_clean"
 
-        claimed = self._claim_interface()
-        try:
-            if claimed and not self.is_mock:
-                # Leer paquete inicial de anuncio de hardware de la TI-Nspire CX II si está disponible
-                try:
-                    raw_ann = bytes(self.dev.read(self.ep_in, BULK_MAX_PACKET_SIZE, timeout=800))
-                    hardware_announcement = parse_cxii_announcement_packet(raw_ann)
-                except Exception:
-                    pass
+        storage_before = self.get_storage_status()
+        storage_after = storage_before
 
-                self.handshake(timeout_ms=300)
-                for fpath in files_to_delete:
-                    del_pkt = build_file_delete_packet(remote_path=fpath, is_directory=False, seq_num=self._next_seq())
-                    try:
-                        self.send_packet(del_pkt, timeout_ms=400)
+        if not self.is_mock and self.is_cx_ii:
+            with _CX2NNSESession(self.dev, self.ep_in, self.ep_out) as sess:
+                hardware_announcement = sess.hardware_announcement
+                storage_before = sess.query_storage_status()
+
+                def _wipe_dir_recursive(dir_path: str) -> None:
+                    nonlocal bytes_freed
+                    items = sess.list_dir(dir_path)
+                    for item in items:
+                        if item.entry_type == "directory":
+                            _wipe_dir_recursive(item.path)
+                            try:
+                                if sess.delete_dir(item.path):
+                                    deleted_dirs.append(item.path)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                if sess.delete_file(item.path):
+                                    deleted_files.append(item.path)
+                                    bytes_freed += item.size_bytes
+                            except Exception:
+                                pass
+
+                _wipe_dir_recursive("/")
+                storage_after = sess.query_storage_status()
+                delete_packets_sent = sess.packets_sent
+                acks_received = sess.acks_received
+                usb_bus_reset_ok = True
+        else:
+            for _dir_path, entries in list(_VIRTUAL_FILESYSTEM.items()):
+                for entry in list(entries):
+                    if entry.entry_type == "file":
+                        deleted_files.append(entry.path)
+                        bytes_freed += entry.size_bytes
+
+            claimed = self._claim_interface()
+            try:
+                if claimed:
+                    for fpath in deleted_files:
+                        del_pkt = build_file_delete_packet(
+                            remote_path=fpath, is_directory=False, seq_num=self._next_seq()
+                        )
+                        self.send_packet(del_pkt, timeout_ms=200)
                         delete_packets_sent += 1
                         if self.receive_packet(timeout_ms=200) is not None:
                             acks_received += 1
-                    except Exception:
-                        break
-            elif self.is_mock:
-                for fpath in files_to_delete:
-                    del_pkt = build_file_delete_packet(remote_path=fpath, is_directory=False, seq_num=self._next_seq())
-                    self.send_packet(del_pkt, timeout_ms=200)
-                    delete_packets_sent += 1
-                    if self.receive_packet(timeout_ms=200) is not None:
-                        acks_received += 1
-        finally:
-            self._release_interface()
+            finally:
+                self._release_interface()
 
-        if reset_usb_bus:
-            try:
-                self.dev.reset()
-                usb_bus_reset_ok = True
-            except Exception:
-                usb_bus_reset_ok = self.is_mock
+            if reset_usb_bus:
+                try:
+                    self.dev.reset()
+                    usb_bus_reset_ok = True
+                except Exception:
+                    usb_bus_reset_ok = self.is_mock
 
-        # Restaurar el sistema de archivos de documentos al estado limpio de fábrica (sin archivos .tns)
+        # Actualizar caché local para reflejar el almacenamiento vacío
         _VIRTUAL_FILESYSTEM.clear()
-        _VIRTUAL_FILESYSTEM["/"] = [
-            RemoteFileEntry(
-                name="PyLib",
-                path="/PyLib",
-                entry_type="directory",
-                size_bytes=0,
-                modified_timestamp=int(time.time()),
-            ),
-            RemoteFileEntry(
-                name="MyLib",
-                path="/MyLib",
-                entry_type="directory",
-                size_bytes=0,
-                modified_timestamp=int(time.time()),
-            ),
-            RemoteFileEntry(
-                name="Examples",
-                path="/Examples",
-                entry_type="directory",
-                size_bytes=0,
-                modified_timestamp=int(time.time()),
-            ),
-        ]
+        _VIRTUAL_FILESYSTEM["/"] = []
         _VIRTUAL_FILESYSTEM["/PyLib"] = []
         _VIRTUAL_FILESYSTEM["/MyLib"] = []
         _VIRTUAL_FILESYSTEM["/Examples"] = []
+
+        if self.is_mock:
+            storage_after = self.get_storage_status()
 
         # Limpiar archivos .tns en la cola local ~/.ti_nspire_mcp/outbox
         staging_dir = Path.home() / ".ti_nspire_mcp" / "outbox"
@@ -683,7 +1115,6 @@ class TIUSBDevice:
                 except Exception:
                     pass
 
-        storage_after = self.get_storage_status()
         dev_info = self.get_info()
         if hardware_announcement and hardware_announcement.get("serial_number"):
             dev_info["hardware_serial_ecid"] = hardware_announcement["serial_number"]
@@ -697,12 +1128,14 @@ class TIUSBDevice:
             "os_version": storage_after.os_version,
             "usb_bus_reset_executed": usb_bus_reset_ok,
             "transport_mode": transport_mode,
-            "deleted_files_count": len(files_to_delete),
-            "deleted_files": files_to_delete,
+            "deleted_files_count": len(deleted_files),
+            "deleted_files": deleted_files,
+            "deleted_directories_count": len(deleted_dirs),
+            "deleted_directories": deleted_dirs,
             "bytes_freed": bytes_freed,
             "staged_outbox_cleared": staged_removed,
             "telemetry": {
-                "service_id": "0x4060 (CMD_FILE_DELETE 0x09 + USB Bus Reset)",
+                "service_id": "0x4060 (CMD_FILE_DELETE 0x0901 + CMD_DIR_DELETE 0x0B03)",
                 "endpoint_out": f"0x{self.ep_out:02X}",
                 "endpoint_in": f"0x{self.ep_in:02X}",
                 "delete_packets_sent": delete_packets_sent,
@@ -713,8 +1146,8 @@ class TIUSBDevice:
             "storage_before": storage_before.model_dump(),
             "storage_after": storage_after.model_dump(),
             "message": (
-                f"Restauración de fábrica de documentos completada ({len(files_to_delete)} archivos eliminados, "
-                f"{bytes_freed} bytes liberados) y puerto USB reiniciado conservando OS {storage_after.os_version}."
+                f"Limpieza profunda completada en la calculadora: {len(deleted_files)} archivos y "
+                f"{len(deleted_dirs)} carpetas eliminados ({bytes_freed} bytes liberados), conservando OS {storage_after.os_version}."
             ),
         }
 

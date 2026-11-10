@@ -16,7 +16,7 @@ import base64
 import io
 import struct
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Any, Final
 
 from PIL import Image, ImageDraw
 
@@ -59,13 +59,84 @@ SCREEN_FRAME_BYTES: Final[int] = SCREEN_WIDTH * SCREEN_HEIGHT * 2  # 153,600 byt
 
 def compute_data_checksum(data: bytes) -> int:
     """
-    Calcula el checksum de 16 bits del payload de datos NavNet.
-    Algoritmo estándar NavNet: acumulador de 16 bits sobre cada byte.
+    Calcula el checksum polinomial de 16 bits del payload de datos NavNet (packet.c: calculate_data_checksum).
+    """
+    s = 0
+    for byte in data:
+        t1 = ((byte << 8) | (s >> 8)) & 0xFFFF
+        s &= 0xFF
+        t2 = ((((s & 0xF) << 4) ^ s) << 8) & 0xFFFF
+        t3 = t2 >> 5
+        s = ((t3 >> 7) ^ t1 ^ t2 ^ t3) & 0xFFFF
+    return s
+
+
+def compute_nnse_checksum(data: bytes) -> int:
+    """
+    Calcula el checksum ones'-complement de 16 bits de una trama NNSE de TI-Nspire CX II (cx2.cpp).
     """
     acc = 0
-    for b in data:
-        acc = (acc + b) & 0xFFFF
+    for i in range(0, len(data) - 1, 2):
+        acc += (data[i] << 8) | data[i + 1]
+    if len(data) & 1:
+        acc += data[-1] << 8
+    while acc > 0xFFFF:
+        acc = (acc >> 16) + (acc & 0xFFFF)
     return acc
+
+
+def encode_nnse_message(
+    service: int,
+    data: bytes = b"",
+    misc: int = 0,
+    src: int = 0xFE,
+    dest: int = 0x01,
+    unknown: int = 0,
+    req_ack: int = 0,
+    seqno: int = 0,
+) -> bytes:
+    """Codifica un mensaje de 12 bytes de cabecera NNSE para la familia TI-Nspire CX II (0xE022)."""
+    length = 12 + len(data)
+    pkt = bytearray(struct.pack(">BBBBBBHHH", misc, service, src, dest, unknown, req_ack, length, seqno, 0))
+    pkt.extend(data)
+    chk = compute_nnse_checksum(bytes(pkt)) ^ 0xFFFF
+    struct.pack_into(">H", pkt, 10, chk)
+    return bytes(pkt)
+
+
+def decode_nnse_message(raw: bytes) -> dict[str, Any] | None:
+    """Decodifica y valida una trama NNSE de 12 bytes de cabecera recibida de una TI-Nspire CX II."""
+    if len(raw) < 12:
+        return None
+    length = struct.unpack(">H", raw[6:8])[0]
+    if length < 12 or len(raw) < length:
+        return None
+    msg = raw[:length]
+    if compute_nnse_checksum(msg) != 0xFFFF:
+        return None
+    misc, service, src, dest, unknown, req_ack, length, seqno, _chk = struct.unpack(">BBBBBBHHH", msg[:12])
+    return {
+        "misc": misc,
+        "service": service,
+        "src": src,
+        "dest": dest,
+        "unknown": unknown,
+        "req_ack": req_ack,
+        "length": length,
+        "seqno": seqno,
+        "data": bytes(msg[12:]),
+    }
+
+
+def encode_nspire_path(path: str) -> bytes:
+    """
+    Codifica una ruta de archivo de TI-Nspire (formato data_build 's' de libnspire):
+    UTF-8 rellenado con ceros hasta al menos 8 bytes más un NUL terminador (mínimo 9 bytes).
+    """
+    clean = path if path.startswith("/") else f"/{path}"
+    raw = clean.encode("utf-8")
+    pad_len = max(len(raw), 8) + 1
+    return raw + b"\x00" * (pad_len - len(raw))
 
 
 def compute_header_checksum(header_15_bytes: bytes) -> int:
@@ -105,9 +176,14 @@ class NavNetPacket:
     payload: bytes = field(default=b"")
 
     def to_bytes(self) -> bytes:
-        """Serializa el paquete NavNet (cabecera de 16 bytes + payload)."""
-        size_field = min(len(self.payload), 0xFF)
-        data_chk = compute_data_checksum(self.payload)
+        """Serializa el paquete NavNet (cabecera de 16 bytes + payload, con soporte BIG_DATA 0xFF)."""
+        if len(self.payload) < 0xFF:
+            body = self.payload
+            size_field = len(self.payload)
+        else:
+            body = struct.pack(">I", len(self.payload)) + self.payload
+            size_field = 0xFF
+        data_chk = compute_data_checksum(body)
         header_15 = struct.pack(
             ">HHHHHHBBB",
             NAVNET_MAGIC,
@@ -121,7 +197,7 @@ class NavNetPacket:
             self.seq_num & 0xFF,
         )
         hdr_chk = compute_header_checksum(header_15)
-        return header_15 + bytes([hdr_chk]) + self.payload
+        return header_15 + bytes([hdr_chk]) + body
 
     def to_nnse_bytes(self) -> bytes:
         """
@@ -168,11 +244,17 @@ class NavNetPacket:
         if magic != NAVNET_MAGIC:
             raise ValueError(f"Magic NavNet inválido: 0x{magic:04X} (esperado 0x54FD).")
 
-        payload = raw[16:]
-        if size_field < 0xFF and len(payload) > size_field:
-            payload = payload[:size_field]
+        if size_field != 0xFF:
+            body = raw[16 : 16 + size_field]
+            payload = body
+        else:
+            if len(raw) < 20:
+                raise ValueError("Paquete BIG_DATA NavNet truncado.")
+            ext_len = struct.unpack(">I", raw[16:20])[0]
+            body = raw[16 : 20 + ext_len]
+            payload = raw[20 : 20 + ext_len]
 
-        calc_data_chk = compute_data_checksum(payload)
+        calc_data_chk = compute_data_checksum(body)
         if data_chk != calc_data_chk:
             raise ValueError(
                 f"Checksum de datos NavNet inválido: esperado 0x{data_chk:04X}, calculado 0x{calc_data_chk:04X}"
@@ -395,6 +477,40 @@ def decompress_rle_rgb565(data: bytes, expected_bytes: int = SCREEN_FRAME_BYTES)
             out.extend(data[idx : idx + literal_len])
             idx += literal_len
 
+    if len(out) < expected_bytes:
+        out.extend(b"\x00" * (expected_bytes - len(out)))
+    return bytes(out[:expected_bytes])
+
+
+def decompress_nspire_rle_bytes(data: bytes, expected_bytes: int = SCREEN_FRAME_BYTES) -> bytes:
+    """
+    Descomprime el flujo RLE nativo del servicio 0x4024 de TI-Nspire CX / CX II (16-bpp).
+    En pantallas a color de 16 bits (320x240), la unidad RLE es una palabra de 32 bits
+    (4 bytes = par de píxeles RGB565 Little-Endian):
+      - Si ctrl < 0 (signed int8): copia `(-ctrl) + 1` palabras de 4 bytes literales siguientes.
+      - Si ctrl >= 0 (signed int8): repite la siguiente palabra de 4 bytes `(ctrl + 1)` veces.
+    """
+    out = bytearray()
+    idx = 0
+    n = len(data)
+    unit = 4
+    while idx < n and len(out) < expected_bytes:
+        ctrl = struct.unpack("b", data[idx : idx + 1])[0]
+        idx += 1
+        if ctrl < 0:
+            count = (-ctrl) + 1
+            byte_len = count * unit
+            take = min(byte_len, expected_bytes - len(out), n - idx)
+            out.extend(data[idx : idx + take])
+            idx += byte_len
+        else:
+            count = ctrl + 1
+            word = data[idx : idx + unit]
+            idx += unit
+            if len(word) < unit:
+                break
+            take_words = min(count, (expected_bytes - len(out)) // unit)
+            out.extend(word * take_words)
     if len(out) < expected_bytes:
         out.extend(b"\x00" * (expected_bytes - len(out)))
     return bytes(out[:expected_bytes])

@@ -233,6 +233,31 @@ def list_remote_filesystem(directory: str = "/") -> dict[str, Any]:
     return dev.list_remote_filesystem(directory=directory)
 
 
+@server.tool()
+def factory_reset_calculator(
+    mode: str = "delete_documents",
+    reset_usb_bus: bool = True,
+) -> dict[str, Any]:
+    """
+    Ejecuta la restauración de fábrica de documentos de la calculadora TI-Nspire CX II vía MCP
+    (equivalente a la Opción 2 'Delete Document Folder Contents' del Menú de Mantenimiento):
+    elimina todos los archivos .tns de usuario mediante paquetes NavNet 0x4060 (CMD_FILE_DELETE 0x09),
+    conserva el Sistema Operativo instalado y ejecuta un reinicio físico del bus USB (dev.reset()).
+
+    :param mode: 'delete_documents' (Opción 2: limpia todos los documentos conservando el OS).
+    :param reset_usb_bus: Si es True, envía un USB Bus Reset al hardware al finalizar.
+    """
+    dev = TIUSBDevice.find_first(allow_mock_fallback=True)
+    if dev is None:
+        return {
+            "success": False,
+            "telemetry": build_usb_error_telemetry(
+                "No se detectó calculadora conectada para ejecutar el reinicio de fábrica."
+            ),
+        }
+    return dev.factory_reset_documents(mode=mode, reset_usb_bus=reset_usb_bus)
+
+
 # ==============================================================================
 # 3. MCP TOOLS - MOTOR AVANZADO .TNS, LATEX, LUA, NDLESS Y LINTER MICROPYTHON
 # ==============================================================================

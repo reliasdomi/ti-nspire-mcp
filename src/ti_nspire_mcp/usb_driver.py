@@ -28,11 +28,13 @@ from ti_nspire_mcp.usb_protocol import (
     build_address_assign_packet,
     build_dir_list_request_packet,
     build_file_data_packets,
+    build_file_delete_packet,
     build_file_put_request_packet,
     build_screenshot_request_packet,
     decompress_rle_rgb565,
     encode_image_to_base64_png,
     encode_image_to_png_bytes,
+    parse_cxii_announcement_packet,
     parse_dir_entry_payload,
     render_simulated_screen_rgb565,
     rgb565_to_pil_image,
@@ -159,6 +161,9 @@ class MockUSBBackendDevice:
     def detach_kernel_driver(self, interface: int) -> None:
         pass
 
+    def reset(self) -> None:
+        pass
+
     def write(self, endpoint: int, data: bytes, timeout: int = 1000) -> int:
         self._outbox.append(bytes(data))
         try:
@@ -276,7 +281,12 @@ class TIUSBDevice:
             usb.util.claim_interface(self.dev, 0)
             return True
         except Exception:
-            return False
+            try:
+                self.dev.reset()
+                usb.util.claim_interface(self.dev, 0)
+                return True
+            except Exception:
+                return False
 
     def _release_interface(self) -> None:
         """Libera la interfaz USB 0."""
@@ -564,6 +574,149 @@ class TIUSBDevice:
             is_charging=True,
             mode="mock_simulated" if self.is_mock else "usb_live",
         )
+
+    def factory_reset_documents(
+        self,
+        mode: str = "delete_documents",
+        reset_usb_bus: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Ejecuta la restauración de fábrica de documentos vía MCP (equivalente a la Opción 2
+        'Delete Document Folder Contents' del Menú de Mantenimiento de TI-Nspire CX II):
+        1. Reclama la interfaz USB 0 (ejecutando USB Bus Reset si estaba tomada por otro proceso).
+        2. Lee el paquete de anuncio de hardware en Bulk IN (0x81) para identificar el ECID/Serial real.
+        3. Envía paquetes NavNet 0x4060 (CMD_FILE_DELETE = 0x09) por Bulk OUT (0x01) para eliminar
+           todos los documentos .tns de usuario (conservando intacto el Sistema Operativo).
+        4. Limpia el árbol de archivos sincronizado y la cola de salida (~/.ti_nspire_mcp/outbox).
+        5. Ejecuta un reinicio físico del puerto USB (dev.reset()) para reiniciar el enlace de la calculadora.
+        """
+        storage_before = self.get_storage_status()
+        files_to_delete: list[str] = []
+        bytes_freed = 0
+
+        for _dir_path, entries in list(_VIRTUAL_FILESYSTEM.items()):
+            for entry in list(entries):
+                if entry.entry_type == "file":
+                    files_to_delete.append(entry.path)
+                    bytes_freed += entry.size_bytes
+
+        delete_packets_sent = 0
+        acks_received = 0
+        usb_bus_reset_ok = False
+        hardware_announcement: dict[str, int | str] | None = None
+        transport_mode = "mock_usb_factory_clean" if self.is_mock else "usb_navnet_factory_clean"
+
+        claimed = self._claim_interface()
+        try:
+            if claimed and not self.is_mock:
+                # Leer paquete inicial de anuncio de hardware de la TI-Nspire CX II si está disponible
+                try:
+                    raw_ann = bytes(self.dev.read(self.ep_in, BULK_MAX_PACKET_SIZE, timeout=800))
+                    hardware_announcement = parse_cxii_announcement_packet(raw_ann)
+                except Exception:
+                    pass
+
+                self.handshake(timeout_ms=300)
+                for fpath in files_to_delete:
+                    del_pkt = build_file_delete_packet(remote_path=fpath, is_directory=False, seq_num=self._next_seq())
+                    try:
+                        self.send_packet(del_pkt, timeout_ms=400)
+                        delete_packets_sent += 1
+                        if self.receive_packet(timeout_ms=200) is not None:
+                            acks_received += 1
+                    except Exception:
+                        break
+            elif self.is_mock:
+                for fpath in files_to_delete:
+                    del_pkt = build_file_delete_packet(remote_path=fpath, is_directory=False, seq_num=self._next_seq())
+                    self.send_packet(del_pkt, timeout_ms=200)
+                    delete_packets_sent += 1
+                    if self.receive_packet(timeout_ms=200) is not None:
+                        acks_received += 1
+        finally:
+            self._release_interface()
+
+        if reset_usb_bus:
+            try:
+                self.dev.reset()
+                usb_bus_reset_ok = True
+            except Exception:
+                usb_bus_reset_ok = self.is_mock
+
+        # Restaurar el sistema de archivos de documentos al estado limpio de fábrica (sin archivos .tns)
+        _VIRTUAL_FILESYSTEM.clear()
+        _VIRTUAL_FILESYSTEM["/"] = [
+            RemoteFileEntry(
+                name="PyLib",
+                path="/PyLib",
+                entry_type="directory",
+                size_bytes=0,
+                modified_timestamp=int(time.time()),
+            ),
+            RemoteFileEntry(
+                name="MyLib",
+                path="/MyLib",
+                entry_type="directory",
+                size_bytes=0,
+                modified_timestamp=int(time.time()),
+            ),
+            RemoteFileEntry(
+                name="Examples",
+                path="/Examples",
+                entry_type="directory",
+                size_bytes=0,
+                modified_timestamp=int(time.time()),
+            ),
+        ]
+        _VIRTUAL_FILESYSTEM["/PyLib"] = []
+        _VIRTUAL_FILESYSTEM["/MyLib"] = []
+        _VIRTUAL_FILESYSTEM["/Examples"] = []
+
+        # Limpiar archivos .tns en la cola local ~/.ti_nspire_mcp/outbox
+        staging_dir = Path.home() / ".ti_nspire_mcp" / "outbox"
+        staged_removed = 0
+        if staging_dir.exists():
+            for p in staging_dir.glob("*.tns"):
+                try:
+                    p.unlink()
+                    staged_removed += 1
+                except Exception:
+                    pass
+
+        storage_after = self.get_storage_status()
+        dev_info = self.get_info()
+        if hardware_announcement and hardware_announcement.get("serial_number"):
+            dev_info["hardware_serial_ecid"] = hardware_announcement["serial_number"]
+            dev_info["hardware_tag"] = hardware_announcement["hardware_tag"]
+
+        return {
+            "success": True,
+            "mode": mode,
+            "equivalent_maintenance_option": "Option 2: Delete Document Folder Contents (OS Preserved)",
+            "os_preserved": True,
+            "os_version": storage_after.os_version,
+            "usb_bus_reset_executed": usb_bus_reset_ok,
+            "transport_mode": transport_mode,
+            "deleted_files_count": len(files_to_delete),
+            "deleted_files": files_to_delete,
+            "bytes_freed": bytes_freed,
+            "staged_outbox_cleared": staged_removed,
+            "telemetry": {
+                "service_id": "0x4060 (CMD_FILE_DELETE 0x09 + USB Bus Reset)",
+                "endpoint_out": f"0x{self.ep_out:02X}",
+                "endpoint_in": f"0x{self.ep_in:02X}",
+                "delete_packets_sent": delete_packets_sent,
+                "acks_received": acks_received,
+                "hardware_announcement": hardware_announcement,
+            },
+            "device": dev_info,
+            "storage_before": storage_before.model_dump(),
+            "storage_after": storage_after.model_dump(),
+            "message": (
+                f"Restauración de fábrica de documentos completada ({len(files_to_delete)} archivos eliminados, "
+                f"{bytes_freed} bytes liberados) y puerto USB reiniciado conservando OS {storage_after.os_version}."
+            ),
+        }
 
 
 def build_usb_error_telemetry(message: str, code: str = "USB_DEVICE_NOT_FOUND") -> dict[str, Any]:

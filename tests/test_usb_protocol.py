@@ -19,9 +19,11 @@ from ti_nspire_mcp.usb_protocol import (
     build_address_assign_packet,
     build_dir_list_request_packet,
     build_file_data_packets,
+    build_file_delete_packet,
     build_file_put_request_packet,
     build_screenshot_request_packet,
     decompress_rle_rgb565,
+    parse_cxii_announcement_packet,
     parse_dir_entry_payload,
     pil_image_to_rgb565,
     render_simulated_screen_rgb565,
@@ -75,6 +77,18 @@ def test_file_transfer_and_dir_packets() -> None:
 
     scr_req = build_screenshot_request_packet(seq_num=6, use_rle=True)
     assert scr_req.dst_service == 0x4024
+
+    del_req = build_file_delete_packet("/PyLib/demo.tns", is_directory=False, seq_num=7)
+    assert b"/PyLib/demo.tns\x00" in del_req.payload
+
+    raw_ann = bytes.fromhex(
+        "0001ffff0000004d040813b70000000002000000000000314335303030303030303030304632354633374542313243443833"
+        "000000000000000000000000000000000000000000000000000011"
+    )
+    ann_info = parse_cxii_announcement_packet(raw_ann)
+    assert ann_info is not None
+    assert ann_info["serial_number"] == "1C50000000000F25F37EB12CD83"
+    assert ann_info["packet_length"] == 77
 
 
 def test_parse_dir_entry_payload() -> None:

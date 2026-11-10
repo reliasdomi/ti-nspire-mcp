@@ -15,6 +15,7 @@ from ti_nspire_mcp.server import (
     create_multipage_tns_document,
     create_python_tns_document,
     direct_upload_tns,
+    factory_reset_calculator,
     generate_esp32_firmware,
     generate_python_template,
     get_calculator_status,
@@ -102,6 +103,13 @@ def test_mcp_usb_and_tns_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     live_scr = capture_screen_live(save_path=str(tmp_path / "cap.png"))
     assert live_scr["success"] is True
     assert (tmp_path / "cap.png").exists()
+
+    reset_res = factory_reset_calculator(mode="delete_documents", reset_usb_bus=True)
+    assert reset_res["success"] is True
+    assert reset_res["os_preserved"] is True
+    assert reset_res["deleted_files_count"] >= 1
+    fs_after = list_remote_filesystem("/PyLib")
+    assert fs_after["entry_count"] == 0
 
 
 def test_advanced_tns_latex_lua_ndless_and_inspector_tools(tmp_path: Path) -> None:

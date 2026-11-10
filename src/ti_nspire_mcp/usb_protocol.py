@@ -43,6 +43,8 @@ CMD_FILE_PUT_OK: Final[int] = 0x04
 CMD_FILE_DATA_CHUNK: Final[int] = 0x05
 CMD_FILE_EOF: Final[int] = 0x06
 CMD_FILE_GET_REQ: Final[int] = 0x07
+CMD_FILE_DELETE: Final[int] = 0x09
+CMD_DIR_DELETE: Final[int] = 0x0B
 CMD_DIR_LIST_START: Final[int] = 0x0D
 CMD_DIR_LIST_NEXT: Final[int] = 0x0E
 CMD_DIR_LIST_END: Final[int] = 0x0F
@@ -268,6 +270,50 @@ def build_dir_list_request_packet(remote_dir: str = "/", seq_num: int = 2) -> Na
         seq_num=seq_num,
         payload=payload,
     )
+
+
+def build_file_delete_packet(remote_path: str, is_directory: bool = False, seq_num: int = 2) -> NavNetPacket:
+    """
+    Construye el paquete NavNet de eliminación de archivo o directorio en el servicio 0x4060
+    (usado en la limpieza de documentos tipo Opción 2 'Delete Document Folder Contents').
+    """
+    clean_path = remote_path if remote_path.startswith("/") else f"/{remote_path}"
+    cmd = CMD_DIR_DELETE if is_directory else CMD_FILE_DELETE
+    payload = bytes([cmd, 0x01]) + clean_path.encode("utf-8") + b"\x00"
+    return NavNetPacket(
+        src_addr=HOST_ADDR,
+        src_service=SERVICE_HOST_PORT,
+        dst_addr=DEVICE_ADDR,
+        dst_service=SERVICE_FILE_SYNC,
+        seq_num=seq_num,
+        payload=payload,
+    )
+
+
+def parse_cxii_announcement_packet(raw: bytes) -> dict[str, int | str] | None:
+    """
+    Parsea el paquete de anuncio de hardware de 77 bytes enviado por la TI-Nspire CX II
+    en el endpoint Bulk IN (0x81) tras un reinicio de bus USB (cabecera 00 01 ff ff 00 00 00 4d).
+    Extrae el número de serie / ECID de hardware real de 27 caracteres (ej. '1C50000000000F25F37EB12CD83').
+    """
+    if len(raw) < 32 or raw[:4] != b"\x00\x01\xff\xff":
+        return None
+    pkt_len = struct.unpack(">I", raw[4:8])[0]
+    hw_tag = raw[8:12].hex().upper()
+    ascii_segment = raw[16:]
+    # Buscar cadena alfanumérica ASCII de serie/ECID
+    serial_chars: list[str] = []
+    for b in ascii_segment:
+        if 0x30 <= b <= 0x39 or 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A:
+            serial_chars.append(chr(b))
+        elif serial_chars:
+            break
+    serial_str = "".join(serial_chars)
+    return {
+        "packet_length": pkt_len,
+        "hardware_tag": f"0x{hw_tag}",
+        "serial_number": serial_str or "UNKNOWN",
+    }
 
 
 def build_screenshot_request_packet(seq_num: int = 2, use_rle: bool = True) -> NavNetPacket:
